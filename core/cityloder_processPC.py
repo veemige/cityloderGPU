@@ -1,4 +1,5 @@
 import laspy
+from pathlib import Path
 from scipy.spatial import cKDTree
 from scipy.spatial import ConvexHull
 import numpy as np
@@ -13,23 +14,55 @@ def read_las_file(file_path, class_building = 6, class_ground = 2):
         file_path (str): Path to the .las file.
 
     Returns:
-        coords (np.ndarray): Nx3 array of XYZ coordinates.
-        classification (np.ndarray): N-length array of classifications.
+        xyz_building (np.ndarray): Building-class XYZ points from all input files.
+        xyz_ground (np.ndarray): Ground-class XYZ points from all input files.
+        point_count (int): Total number of points across all files.
+        bounds (tuple): XY minimum and maximum for the loaded LAS files.
     """
-    # Open the LAS file
-    las = laspy.read(file_path)
+    if isinstance(file_path, (list, tuple)):
+        paths = [Path(path) for path in file_path]
+    else:
+        paths = [Path(path.strip()) for path in str(file_path).split(",") if path.strip()]
 
-    
-    # Extract XYZ coordinates as Nx3 array
-    coords = np.vstack((las.x, las.y, las.z)).T
-    
-    # Extract classification
-    classification = np.array(las.classification)
+    if not paths:
+        raise ValueError("Informe ao menos um arquivo LAS.")
 
-    xyz_ground = coords[classification == class_ground, :].astype(float)
-    xyz_building = coords[classification == class_building, :].astype(float)
-    
-    return xyz_building, xyz_ground, coords
+    building_chunks = []
+    ground_chunks = []
+    point_count = 0
+    bounds_min = np.full(2, np.inf)
+    bounds_max = np.full(2, -np.inf)
+
+    for path in paths:
+        if not path.is_file():
+            raise FileNotFoundError(f"Arquivo LAS não encontrado: {path}")
+
+        las = laspy.read(path)
+        classification = np.asarray(las.classification)
+        x = np.asarray(las.x)
+        y = np.asarray(las.y)
+        z = np.asarray(las.z)
+        point_count += len(classification)
+        bounds_min = np.minimum(bounds_min, [x.min(), y.min()])
+        bounds_max = np.maximum(bounds_max, [x.max(), y.max()])
+
+        for class_code, chunks in (
+            (class_building, building_chunks),
+            (class_ground, ground_chunks),
+        ):
+            mask = classification == class_code
+            if np.any(mask):
+                chunks.append(np.column_stack((x[mask], y[mask], z[mask])).astype(float))
+
+    if not ground_chunks:
+        raise ValueError(f"Nenhum ponto da classe de terreno {class_ground} foi encontrado.")
+    if not building_chunks:
+        raise ValueError(f"Nenhum ponto da classe de edifício {class_building} foi encontrado.")
+
+    xyz_building = np.concatenate(building_chunks, axis=0)
+    xyz_ground = np.concatenate(ground_chunks, axis=0)
+
+    return xyz_building, xyz_ground, point_count, (bounds_min, bounds_max)
 
 def generate_ground_polygon(xyz, other, outname="ground_polygon", offset=50.0):
     """
@@ -39,6 +72,8 @@ def generate_ground_polygon(xyz, other, outname="ground_polygon", offset=50.0):
     """
     xyz = np.asarray(xyz, dtype=np.float64)
     other = np.asarray(other, dtype=np.float64)
+    if other.size == 0:
+        raise ValueError("Não há pontos de terreno para gerar o limite do mapa.")
     aus = np.vstack((other, xyz))
 
     pts2d = aus[:, :2]

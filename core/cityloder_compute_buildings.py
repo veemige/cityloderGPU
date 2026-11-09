@@ -2,9 +2,11 @@ import os
 import numpy as np
 import shapefile
 
-from matplotlib.path import Path  # for inpolygon equivalent
+from matplotlib.path import Path as MatplotlibPath  # for CPU point-in-polygon
 from scipy.spatial import cKDTree
 from tqdm import tqdm
+
+from cityloder_gpu import fit_roof_planes, gpu_summary, points_in_polygon
 
 
 ## -------------------------------------------------------------------------------
@@ -29,9 +31,19 @@ def read_shapefile_to_dict(shapefile_path):
     sf = shapefile.Reader(shapefile_path)
     M = []
     
-    for shape_rec in sf.shapeRecords():
-        shape = shape_rec.shape
-        rec = shape_rec.record.as_dict() if hasattr(shape_rec.record, "as_dict") else dict(zip(sf.fields[1:], shape_rec.record))
+    try:
+        shape_records = sf.shapeRecords()
+    except shapefile.ShapefileException as exc:
+        if "DbfReader requires" not in str(exc):
+            raise
+        shape_records = [(shape, {}) for shape in sf.iterShapes()]
+
+    for shape_rec in shape_records:
+        if isinstance(shape_rec, tuple):
+            shape, rec = shape_rec
+        else:
+            shape = shape_rec.shape
+            rec = shape_rec.record.as_dict() if hasattr(shape_rec.record, "as_dict") else dict(zip([field[0] for field in sf.fields[1:]], shape_rec.record))
         
         # Initialize output coordinates
         x_coords = []
@@ -67,7 +79,25 @@ def read_shapefile_to_dict(shapefile_path):
     
     return M
 
-def PointSelectionAndDataStructure(xyz = None,M_i = None,other = None): 
+def _points_in_bbox(points, tree, x_min, x_max, y_min, y_max):
+    if tree is None:
+        candidates = points
+    else:
+        center = ((x_min + x_max) / 2.0, (y_min + y_max) / 2.0)
+        radius = np.hypot((x_max - x_min) / 2.0, (y_max - y_min) / 2.0)
+        indices = tree.query_ball_point(center, radius)
+        if not indices:
+            return np.empty((0, points.shape[1]), dtype=points.dtype)
+        candidates = points[indices]
+
+    mask = (
+        (candidates[:, 0] >= x_min) & (candidates[:, 0] <= x_max) &
+        (candidates[:, 1] >= y_min) & (candidates[:, 1] <= y_max)
+    )
+    return candidates[mask]
+
+
+def PointSelectionAndDataStructure(xyz=None, M_i=None, other=None, xyz_tree=None, other_tree=None):
     """
     Combine las point data and a single shapefile data to indentify the 
     points of interest.
@@ -113,21 +143,19 @@ def PointSelectionAndDataStructure(xyz = None,M_i = None,other = None):
 
     # Restrict xyz pointcloud to make elaboration quicker
 
-    mask = (
-    (xyz[:, 0] < xMax + sogliaX) & (xyz[:, 0] > xMin - sogliaX) &
-    (xyz[:, 1] < yMax + sogliaY) & (xyz[:, 1] > yMin - sogliaY)
+    building = _points_in_bbox(
+        xyz, xyz_tree,
+        xMin - sogliaX, xMax + sogliaX,
+        yMin - sogliaY, yMax + sogliaY,
     )
-
-    building = xyz[mask, :]
 
     sogliaX_aus = (xMax - xMin) / 4
     sogliaY_aus = (yMax - yMin) / 4
-    mask_aus = (
-    (other[:, 0] < xMax + sogliaX_aus) & (other[:, 0] > xMin - sogliaX_aus) &
-    (other[:, 1] < yMax + sogliaY_aus) & (other[:, 1] > yMin - sogliaY_aus)
+    other_aus = _points_in_bbox(
+        other, other_tree,
+        xMin - sogliaX_aus, xMax + sogliaX_aus,
+        yMin - sogliaY_aus, yMax + sogliaY_aus,
     )
-
-    other_aus = other[mask_aus, :]
 
     # Initialize label array to properly assign polygons with holes.
     label = np.full(X.size, 1, dtype=float)  # i*ones(numel(X),2)
@@ -143,10 +171,13 @@ def PointSelectionAndDataStructure(xyz = None,M_i = None,other = None):
     pip = xy[label == 0, :]
 
     if pip.shape[0] > 1:  # Need at least 2 points for inpolygon
-        # Create a polygon path
-        poly_path = Path(pip[:-1, :])  # MATLAB pip(1:end-1,:) → pip[:-1,:] in Python
-        # Check which points in building are inside the polygon
-        in_mask = poly_path.contains_points(building[:, :2])
+        # Dense polygons use a CUDA ray-cast kernel when CuPy is installed.
+        polygon = pip[:-1, :]
+        in_mask, _ = points_in_polygon(
+            building[:, :2],
+            polygon,
+            lambda pts, poly: MatplotlibPath(poly).contains_points(pts),
+        )
         if np.any(in_mask):
             building = building[in_mask, :]
 
@@ -332,13 +363,22 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
     points_ground = np.empty((0, 4))
 
     buildings_outside_pc = 0
+    xyz_tree = cKDTree(xyz[:, :2]) if xyz.shape[0] else None
+    other_tree = cKDTree(other[:, :2]) if other.shape[0] else None
+    roof_normals = []
+    roof_rhs = []
+    roof_centers = []
+    pending_buildings = []
 
     for i in tqdm(range(0, len(M)), desc="Processing Buildings"):
 
         # Computing other_aus, control, X, Y, xy, zMin, building
-        other_aus,X,Y,building = PointSelectionAndDataStructure(xyz,M[i],other)
+        other_aus,X,Y,building = PointSelectionAndDataStructure(
+            xyz, M[i], other, xyz_tree, other_tree
+        )
 
         if building.shape[0] > 0:
+            z_max = float(np.max(building[:, 2]))
             if building.shape[0] > 50000:
                 building = building[::10, :]
 
@@ -362,9 +402,9 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
             # ----------------- Edit
             val = final_check_adj[i]
             if np.isscalar(val) and np.isnan(val):
-                tree = cKDTree(other_aus[:, :2])
-                _, I = tree.query(xy)
                 if other_aus.shape[0] > 0:
+                    tree = cKDTree(other_aus[:, :2])
+                    _, I = tree.query(xy)
                     z = other_aus[I, 2]
                 else:
                     z = zMin_default * np.ones((xy.shape[0]))
@@ -378,9 +418,9 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
                                     points,
                                     points_ground[points_ground[:, 3] == j, :3]
                                 ])
-                tree = cKDTree(points[:, :2])
-                _, I = tree.query(xy)
                 if points.size != 0:
+                    tree = cKDTree(points[:, :2])
+                    _, I = tree.query(xy)
                     z = points[I, 2]
                 else:
                     z = zMin_default * np.ones((xy.shape[0]))
@@ -389,7 +429,6 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
 
 
 
-            zMax = np.max(building[:, 2])
             points_aus_ground = np.zeros((xy.shape[0],6))
 
             
@@ -403,27 +442,62 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
             ])
             # -----------------
             
-            z = np.full((xy.shape[0], 1), zMax)
-            points_aus_roof = np.ones((xy.shape[0], 6))
-            xyz_aus = np.hstack([xy, z])
-            points_aus_roof[:, 0:3] = xyz_aus
-            points_aus_roof[:, 4] = i
-            
-            points_build_f = points_aus_ground[:, 0:3]
-            points_build_r = points_aus_roof[:, 0:3]
-            points = np.vstack([points_build_f, points_build_r])
-            
-            tr = DefineTR(lab, points_build_f.shape[0])
+            # Fit one planar roof to upper building-class points. The centered
+            # normal equations are solved together on CUDA after point selection.
+            roof_mask = building[:, 2] >= np.quantile(building[:, 2], 0.65)
+            roof_points = building[roof_mask]
+            roof_plane_id = None
+            roof_center = None
+            if roof_points.shape[0] >= 6:
+                roof_center = np.mean(roof_points[:, :2], axis=0)
+                design = np.column_stack(
+                    (roof_points[:, :2] - roof_center, np.ones(roof_points.shape[0]))
+                )
+                normal = design.T @ design
+                rhs = design.T @ roof_points[:, 2]
+                if np.linalg.matrix_rank(normal) == 3:
+                    roof_plane_id = len(roof_normals)
+                    roof_normals.append(normal)
+                    roof_rhs.append(rhs)
+                    roof_centers.append(roof_center)
 
-            # Export OFF files
-            dirNames = f'{temp_fold}/building{i+1}'
-            os.makedirs(dirNames, exist_ok=True)
-            exportFacades(tr,points,dirNames)
-            exportPavement(points_build_f,lab,dirNames)
-            exportRoof(points_build_r,lab,dirNames)
+            pending_buildings.append(
+                (i, xy, lab, points_aus_ground[:, :3], z_max,
+                 roof_plane_id, roof_center, float(np.quantile(building[:, 2], 0.995)))
+            )
 
         else: 
             buildings_outside_pc+=1
+
+    roof_coefficients, roof_gpu_used = fit_roof_planes(roof_normals, roof_rhs)
+
+    for i, xy, lab, points_build_f, z_max, plane_id, roof_center, z_ceiling in tqdm(
+        pending_buildings, desc="Writing LOD meshes"
+    ):
+        roof_lod = "1"
+        roof_heights = np.full(xy.shape[0], z_max, dtype=float)
+        if plane_id is not None:
+            coeff = roof_coefficients[plane_id]
+            roof_heights = (xy - roof_center) @ coeff[:2] + coeff[2]
+            roof_heights = np.maximum(roof_heights, points_build_f[:, 2] + 1.5)
+            roof_heights = np.minimum(roof_heights, z_ceiling + 0.5)
+            roof_lod = "2"
+
+        points_build_r = np.column_stack((xy, roof_heights))
+        points = np.vstack((points_build_f, points_build_r))
+        tr = DefineTR(lab, points_build_f.shape[0])
+
+        dir_names = f"{temp_fold}/building{i+1}"
+        os.makedirs(dir_names, exist_ok=True)
+        exportFacades(tr, points, dir_names)
+        exportPavement(points_build_f, lab, dir_names)
+        exportRoof(points_build_r, lab, dir_names)
+        with open(os.path.join(dir_names, "lod.txt"), "w", encoding="ascii") as lod_file:
+            lod_file.write(roof_lod)
+
+    if roof_gpu_used:
+        print("Roof plane fits: solved as one CUDA batch")
+    print(gpu_summary())
     
     print("Saved building polygons:", len(M))
 

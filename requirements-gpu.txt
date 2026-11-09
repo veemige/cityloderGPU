@@ -1,0 +1,2 @@
+-r core/requirements.txt
+cupy-cuda13x[ctk]

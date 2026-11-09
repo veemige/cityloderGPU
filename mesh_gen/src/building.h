@@ -2,6 +2,7 @@
 #define BUILDING
 
 #include <filesystem>
+#include <limits>
 
 #include <cinolib/meshes/meshes.h>
 #include <cinolib/merge_meshes_at_coincident_vertices.h>
@@ -224,14 +225,35 @@ void Building::create_building_mesh()
     // triangulate the roof
     std::vector<uint> roof_holes = extract_holes(roof);
     Trimesh<> roof_tri = triangulate_with_holes(roof, roof_holes);
-    if (roof_tri.num_verts() != roof.num_verts()) {
-        std::cerr << "Building::create_building_mesh - ERROR: triangulation failed for Building "
-                  << building_ID << ", roof has " << roof.num_verts() << " verts but the triangulated roof has "
-                  << roof_tri.num_verts() << " verts. Check the roof mesh and its holes." << std::endl;
-        exit(0);
+    if (roof_tri.num_verts() < roof.num_verts() || roof_tri.num_polys() == 0) {
+        std::cerr << "Building::create_building_mesh - WARNING: triangulation failed for Building "
+                  << building_ID << "; skipping this building." << std::endl;
+        COMPUTED = true;
+        return;
     }
 
-    // project back to the original z-coordinates
+    // Restore heights by matching triangulated XY coordinates to the original
+    // roof. Triangle may add interior vertices, whose heights are interpolated
+    // by project_back_mesh from their neighbors.
+    z_map.clear();
+    for (uint tri_vid = 0; tri_vid < roof_tri.num_verts(); ++tri_vid) {
+        double best_dist_sq = std::numeric_limits<double>::max();
+        uint best_roof_vid = 0;
+        for (uint roof_vid = 0; roof_vid < roof.num_verts(); ++roof_vid) {
+            const double dx = roof_tri.vert(tri_vid).x() - roof.vert(roof_vid).x();
+            const double dy = roof_tri.vert(tri_vid).y() - roof.vert(roof_vid).y();
+            const double dist_sq = dx * dx + dy * dy;
+            if (dist_sq < best_dist_sq) {
+                best_dist_sq = dist_sq;
+                best_roof_vid = roof_vid;
+            }
+        }
+        if (best_dist_sq <= 1e-12) {
+            z_map[tri_vid] = roof.vert(best_roof_vid).z();
+        }
+    }
+
+    // Project back to the original z-coordinates.
     project_back_mesh(roof_tri, z_map);
 
     // invert facades normals (if necessary)

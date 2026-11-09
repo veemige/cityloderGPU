@@ -116,7 +116,17 @@ def _geometry_to_xy(geom):
     return _join_parts(parts, trailing_nan=True)
 
 
-def footprint_preprocess(fname,hole_thr = 1):
+def _read_shape_records(reader):
+    """Read geometry records, allowing a geometry-only .shp without a .dbf."""
+    try:
+        return reader.shapeRecords()
+    except shapefile.ShapefileException as exc:
+        if "DbfReader requires" not in str(exc):
+            raise
+        return [(shape, {}) for shape in reader.iterShapes()]
+
+
+def footprint_preprocess(fname, hole_thr=1, bounds=None):
     """
     Python translation of the MATLAB function footprintPreprocess,
     with an additional MATLAB-style shaperead-like output `M`.
@@ -142,10 +152,15 @@ def footprint_preprocess(fname,hole_thr = 1):
             - shapefile attributes
     """
     reader = shapefile.Reader(fname)
-    field_names = [f[0] for f in reader.fields[1:]]
+    try:
+        field_names = [f[0] for f in reader.fields[1:]]
+    except shapefile.ShapefileException as exc:
+        if "DbfReader requires" not in str(exc):
+            raise
+        field_names = []
 
     # Keep the same behavior as your current function
-    shape_records = reader.shapeRecords()[1:]
+    shape_records = _read_shape_records(reader)
 
     building = []
     id_building = []
@@ -157,8 +172,11 @@ def footprint_preprocess(fname,hole_thr = 1):
 
     # for i, sr in enumerate(shape_records, start=1):
     for id_oggetto, sr in enumerate(tqdm(shape_records, desc="Processing footprints"), start=1):
-        shp = sr.shape
-        rec = dict(zip(field_names, sr.record))
+        if isinstance(sr, tuple):
+            shp, record = sr
+        else:
+            shp, record = sr.shape, sr.record
+        rec = dict(zip(field_names, record))
 
         # ---------------------------------------------------------------
         # Build MATLAB-style structure entry M
@@ -186,6 +204,12 @@ def footprint_preprocess(fname,hole_thr = 1):
         shape_struct.update(rec)
         original_buildings.append(shape_struct)
         # ---------------------------------------------------------------
+
+        if bounds is not None and shp.points:
+            min_xy = np.min(shp.points, axis=0)[:2]
+            max_xy = np.max(shp.points, axis=0)[:2]
+            if np.any(max_xy < bounds[0]) or np.any(min_xy > bounds[1]):
+                continue
 
         points = np.asarray(shp.points, dtype=float)
         if points.size == 0:

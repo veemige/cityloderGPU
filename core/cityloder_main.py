@@ -18,6 +18,7 @@ def run_cityloder_pipeline(
     class_ground: int = 2,
     temp_fold: str = "temp",
     ground_polygon_name: str = "ground_polygon",
+    graph_target_crs: str = "",
 ) -> dict:
     """
     Run the full CityLoder pipeline.
@@ -44,7 +45,7 @@ def run_cityloder_pipeline(
     # Read LAS / point cloud
     print("Reading las ... ", end="")
     load_start = time.perf_counter()
-    xyz_building, xyz_ground, coords = read_las_file(
+    xyz_building, xyz_ground, point_count, point_bounds = read_las_file(
         las_path,
         class_building,
         class_ground,
@@ -57,10 +58,14 @@ def run_cityloder_pipeline(
 
     # Preprocess footprints
     preprocess_start = time.perf_counter()
-    M, final_id, final_check_adj, M_ori = footprint_preprocess(input2D_path)
+    M, final_id, final_check_adj, M_ori = footprint_preprocess(
+        input2D_path, bounds=point_bounds
+    )
 
     # Preprocess graph
-    graph_updated_path, street_count = preprocess_graph(graph_path, xyz_ground, outname)
+    graph_updated_path, street_count = preprocess_graph(
+        graph_path, xyz_ground, outname, target_crs=graph_target_crs or None
+    )
 
     preprocess_end = time.perf_counter()
     preprocess_duration = preprocess_end - preprocess_start
@@ -121,7 +126,7 @@ def run_cityloder_pipeline(
     ]
     
     print(f"{' Summary ':=^41}")
-    print(f"{'Points in the pointcloud:':30s} {len(coords):8d}")
+    print(f"{'Points in the pointcloud:':30s} {point_count:8d}")
     print(f"{'Footprints in the shapefile:':30s} {len(M_ori):8d}")
     print(f"{'Streets in the street graph:':30s} {street_count:8d}")
 
@@ -145,7 +150,8 @@ if __name__ == "__main__":
             print(
                 "Correct usage: python cityloder_main.py "
                 "<input2D_path> <graph_path> <las_path> <outname> "
-                "[class_building] [class_ground] [temp_fold] [ground_polygon_name]",
+                "[class_building] [class_ground] [temp_fold] [ground_polygon_name] "
+                "[graph_target_crs]",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -159,6 +165,7 @@ if __name__ == "__main__":
         class_ground = int(sys.argv[6]) if len(sys.argv) > 6 else 2
         temp_fold = sys.argv[7] if len(sys.argv) > 7 else "temp"
         ground_polygon_name = sys.argv[8] if len(sys.argv) > 8 else "ground_polygon"
+        graph_target_crs = sys.argv[9] if len(sys.argv) > 9 else ""
 
         result = run_cityloder_pipeline(
             input2D_path=input2D_path,
@@ -169,15 +176,13 @@ if __name__ == "__main__":
             class_ground=class_ground,
             temp_fold=temp_fold,
             ground_polygon_name=ground_polygon_name,
+            graph_target_crs=graph_target_crs,
         )
 
         # print(result)
 
-    except ValueError:
-        print(
-            "Correct usage: class_building and class_ground must be integers",
-            file=sys.stderr,
-        )
+    except ValueError as e:
+        print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
 
     except Exception as e:

@@ -2,9 +2,9 @@
 
 ![License](https://img.shields.io/badge/license-GPL%20v3-blue.svg)
 
-**CityLODer** is an automated pipeline for generating **Level of Detail 1 (LOD1)** urban models from airborne LiDAR point clouds and building footprints. It converts raw geospatial data into high-quality 3D city models suitable for visualization, analysis, and further processing.
+**CityLODer** is an automated pipeline for generating **LOD1 and LOD2** urban models from airborne LiDAR point clouds and building footprints. It converts raw geospatial data into 3D city models suitable for visualization, analysis, and further processing.
 
-The tool provides **OFF meshes** and **CityJSON** file city models. It can also integrate street network data from GeoJSON files when available.
+The tool provides **OBJ meshes** and **CityJSON** file city models. It can also integrate street network data from GeoJSON files when available.
 
 CityLODer is designed for reproducible and cross-platform use through Docker, with wrapper scripts for Windows PowerShell and Linux/macOS Bash. Advanced users can also run the Python and C++ components locally for customization and development.
 
@@ -33,9 +33,10 @@ docker build -t cityloder .
 
 ## Input Data
 
-CityLODer expects all input datasets to use the *same coordinate reference system*.
+The point cloud and building footprints must use the *same coordinate reference system*.
 
-This is critical: the point cloud, building footprints, and optional street network must be spatially aligned.
+Street data must also be spatially aligned, or reprojected by the local runner by
+passing the LAS/footprint CRS as its final argument.
 
 ### Point Cloud
 
@@ -67,13 +68,16 @@ Supported format:
 
 * ESRI Shapefile
 
-Required files:
+Recommended shapefile components:
 
 ```text
 footprints.shp
 footprints.shx
 footprints.dbf
 ```
+
+The local pipeline can also read a geometry-only `.shp`. Without a `.dbf`,
+building attributes are unavailable in the CityJSON output.
 
 Optional but recommended:
 
@@ -231,12 +235,12 @@ Typical structure:
 
 ```text
 output/
-├── city_JSON.city.json
+├── mycity.city.json
 ├── (street_graph_updated.geojson)
 └── mycity/
-    ├── buildings_mesh.off
-    ├── ground_mesh.off
-    └── city_mesh.off
+    ├── buildings_mesh.obj
+    ├── ground_mesh.obj
+    └── city_mesh.obj
 ```
 
 Depending on whether a street network is provided, `street_graph_updated.geojson` may or may not be generated.
@@ -245,10 +249,10 @@ Depending on whether a street network is provided, `street_graph_updated.geojson
 
 | File                           | Description                                              |
 | ------------------------------ | -------------------------------------------------------- |
-| `city_JSON.city.json`          | CityJSON model containing reconstructed city geometry    |
-| `buildings_mesh.off`           | OFF mesh containing reconstructed buildings              |
-| `ground_mesh.off`              | OFF mesh containing the reconstructed ground surface     |
-| `city_mesh.off`                | Combined OFF mesh containing buildings and ground        |
+| `<name>.city.json`             | CityJSON model containing reconstructed city geometry    |
+| `buildings_mesh.obj`           | OBJ mesh containing reconstructed buildings              |
+| `ground_mesh.obj`              | OBJ mesh containing the reconstructed ground surface     |
+| `city_mesh.obj`                | Combined OBJ mesh containing buildings and ground       |
 | `(street_graph_updated.geojson)` | Optional street graph updated with elevation information |
 
 ## Example Workflows
@@ -366,6 +370,38 @@ The default ground class is `2`.
 
 CityLODer can be run without Docker using a local Python/C++ environment.
 
+### Run locally from WSL/Linux
+
+The local runner supports multiple LAS files separated by commas. Build the
+Python environment and C++ mesh generator once, then run the pipeline:
+
+```bash
+python3 -m venv ~/.venvs/cityloder
+source ~/.venvs/cityloder/bin/activate
+pip install -r core/requirements.txt pybind11
+cmake -S mesh_gen -B ~/.cache/cityloder-build -DCMAKE_BUILD_TYPE=Release
+cmake --build ~/.cache/cityloder-build --parallel
+bash wrapper_linux/cityloder_local \
+  "data/394000-6455000.las,data/394000-6456000.las,data/395000-6455000.las,data/395000-6456000.las" \
+  "data/Edificacao.shp" output city_model "data/export (1).geojson" EPSG:31982
+```
+
+The street input is assumed to use RFC 7946 longitude/latitude when its
+coordinates look geographic; pass the target CRS used by the LAS and footprints
+as the final argument. Use an empty street path to omit the graph.
+
+For NVIDIA GPU acceleration under WSL, install the optional CUDA dependencies
+in the same environment:
+
+```bash
+pip install -r requirements-gpu.txt
+```
+
+When CuPy detects a CUDA device, dense point-in-polygon checks and the batch
+roof-plane fit run on the GPU. Other inputs and unsupported systems use the CPU
+path. Buildings with enough roof points receive a fitted sloped roof and LOD2
+geometry; insufficient roof data falls back to LOD1.
+
 ### System Requirements
 
 * Python 3.9+
@@ -384,6 +420,7 @@ CityLODer can be run without Docker using a local Python/C++ environment.
 * [Laspy](https://github.com/laspy/laspy) — LAS/LAZ point cloud handling
 * [pyshp](https://github.com/karoly/pyshp) — shapefile handling
 * [pybind11](https://github.com/pybind/pybind11) — Python/C++ bindings
+* [pyproj](https://pyproj4.github.io/pyproj/stable/) — street coordinate reprojection
 * [tqdm](https://github.com/tqdm/tqdm) — progress bars
 
 ### C++ Dependencies

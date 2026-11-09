@@ -1,9 +1,17 @@
 mesh_gen/build
+core/__pycache__/
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+core/fast_inpolygon*.so
+core/fast_inpolygon
 mesh_gen/.qtcreator
 data
 plots
 *.DS_Store
 CLAUDE.md
 data/
+output/
 run_cityjson.py
 *city.json

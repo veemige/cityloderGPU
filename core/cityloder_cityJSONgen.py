@@ -28,7 +28,7 @@ def read_off(filepath, wrap_faces=False):
     return {"vertices": vertices, "geometry": geometry}
 
 
-def merge_models(models, model_id="merged_buildings"):
+def merge_models(models, model_id="merged_buildings", lod="1"):
     """Merge parsed models, deduplicating vertices."""
     all_vertices = []
     all_geometry = []
@@ -67,7 +67,7 @@ def merge_models(models, model_id="merged_buildings"):
 
     return {
         "id": model_id,
-        "lod": "1",
+        "lod": lod,
         "geometry": new_geometry,
         "vertices": unique_vertices,
     }
@@ -78,7 +78,14 @@ def parse_building(folder):
     pavement = read_off(os.path.join(folder, "pavement_polygon.off"), wrap_faces=True)
     roof = read_off(os.path.join(folder, "roof_polygon.off"))
     facades = read_off(os.path.join(folder, "facades.off"))
-    merged = merge_models([pavement, roof, facades], os.path.basename(folder))
+    lod_path = os.path.join(folder, "lod.txt")
+    try:
+        lod = open(lod_path, "r", encoding="ascii").read().strip()
+    except OSError:
+        lod = "1"
+    if lod not in {"1", "2"}:
+        lod = "1"
+    merged = merge_models([pavement, roof, facades], os.path.basename(folder), lod=lod)
     merged["n_floor"] = len(pavement["geometry"])
     merged["n_roof"] = len(roof["geometry"])
     return merged

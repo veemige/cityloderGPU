@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage:
+  ./wrapper_linux/cityloder_local <las[,las...]> <footprints.shp> [output_dir] [model_name] [streets.geojson] [graph_target_crs]
+
+Run from WSL/Linux after installing the Python requirements and building the
+mesh generator. Relative paths are resolved from the project root.
+Use an empty street path to skip streets. Example target CRS: EPSG:31982.
+EOF
+}
+
+if [[ $# -lt 2 || "$1" == "-h" || "$1" == "--help" ]]; then
+    usage
+    exit $(( $# < 2 ? 1 : 0 ))
+fi
+
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$PROJECT_ROOT"
+
+LAS_PATH="$1"
+FOOTPRINTS_PATH="$2"
+OUTPUT_DIR="${3:-output}"
+MODEL_NAME="${4:-mycity}"
+GRAPH_PATH="${5:-}"
+GRAPH_TARGET_CRS="${6:-}"
+TEMP_FOLD="$OUTPUT_DIR/${MODEL_NAME}_tmp"
+GROUND_POLYGON="$TEMP_FOLD/ground_polygon"
+BUILD_DIR="${CITYLODER_BUILD_DIR:-$HOME/.cache/cityloder-build}"
+PYTHON_BIN="${CITYLODER_PYTHON:-python3}"
+
+mkdir -p "$OUTPUT_DIR" "$TEMP_FOLD"
+
+if [[ ! -x "$BUILD_DIR/city_iconic_mesh" ]]; then
+    cmake -S mesh_gen -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$BUILD_DIR" --parallel
+fi
+
+EXT_SUFFIX="$("$PYTHON_BIN" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+INPOLYGON_MODULE="core/fast_inpolygon${EXT_SUFFIX}"
+if [[ ! -f "$INPOLYGON_MODULE" ]]; then
+    c++ -O3 -Wall -shared -std=c++17 -fPIC \
+        $("$PYTHON_BIN" -m pybind11 --includes) \
+        core/fast_inpolygon.cpp -o "$INPOLYGON_MODULE"
+fi
+
+"$PYTHON_BIN" core/cityloder_main.py \
+    "$FOOTPRINTS_PATH" \
+    "$GRAPH_PATH" \
+    "$LAS_PATH" \
+    "$OUTPUT_DIR/$MODEL_NAME" \
+    6 2 \
+    "$TEMP_FOLD" \
+    "$GROUND_POLYGON" \
+    "$GRAPH_TARGET_CRS"
+
+GRAPH_FOR_MESH=""
+if [[ -n "$GRAPH_PATH" ]]; then
+    GRAPH_FILE="$(basename "$GRAPH_PATH")"
+    GRAPH_STEM="${GRAPH_FILE%.*}"
+    GRAPH_EXT="${GRAPH_FILE##*.}"
+    GRAPH_FOR_MESH="$OUTPUT_DIR/${GRAPH_STEM}_updated.${GRAPH_EXT}"
+fi
+
+"$BUILD_DIR/city_iconic_mesh" \
+    "${GROUND_POLYGON}.off" \
+    "$TEMP_FOLD" \
+    "$GRAPH_FOR_MESH" \
+    "$OUTPUT_DIR/$MODEL_NAME"

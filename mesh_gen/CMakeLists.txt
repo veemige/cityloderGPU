@@ -6,7 +6,8 @@ set(CMAKE_CXX_STANDARD 17)
 ## cinolib
 set(cinolib_DIR ${PROJECT_SOURCE_DIR}/cinolib)
 set(CINOLIB_USES_TRIANGLE ON)
-set(CINOLIB_USES_OPENGL_GLFW_IMGUI ON)
+# This target is a command-line mesh generator and does not use the viewer.
+set(CINOLIB_USES_OPENGL_GLFW_IMGUI OFF)
 find_package(cinolib REQUIRED)
 
 ## general

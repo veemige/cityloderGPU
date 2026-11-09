@@ -6,3 +6,4 @@ shapely
 matplotlib
 pybind11
 tqdm
+pyproj

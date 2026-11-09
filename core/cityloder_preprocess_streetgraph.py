@@ -7,10 +7,10 @@ from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 
-def preprocess_graph(geojson_path, xyz_ground, out_folder):
+def preprocess_graph(geojson_path, xyz_ground, out_folder, target_crs=None):
     """
-    Add Z values to all coordinates in a GeoJSON street graph using the nearest
-    LAS point in 2D, considering only points of a chosen LAS class.
+    Reproject geographic GeoJSON coordinates when a target CRS is provided,
+    then add Z values from the nearest ground-class LAS point.
 
     Parameters
     ----------
@@ -89,6 +89,23 @@ def preprocess_graph(geojson_path, xyz_ground, out_folder):
     # Only run the nearest-neighbor step if at least one valid coordinate exists.
     if xy:
         xy = np.asarray(xy, dtype=float)
+
+        # RFC 7946 GeoJSON coordinates are longitude/latitude. Reproject them
+        # before querying the projected LAS points or writing the updated graph.
+        if np.all(np.abs(xy[:, 0]) <= 180) and np.all(np.abs(xy[:, 1]) <= 90):
+            if not target_crs:
+                raise ValueError(
+                    "O GeoJSON está em longitude/latitude, mas os pontos LAS estão "
+                    "projetados. Informe o CRS de destino (por exemplo EPSG:31982)."
+                )
+            from pyproj import Transformer
+
+            transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+            projected_x, projected_y = transformer.transform(xy[:, 0], xy[:, 1])
+            xy = np.column_stack((projected_x, projected_y))
+            for coord, projected in zip(nodes, xy):
+                coord[0], coord[1] = float(projected[0]), float(projected[1])
+
         _, idx = cKDTree(xyz_ground[:, :2]).query(xy, k=1)
         for coord, z in zip(nodes, xyz_ground[idx, 2]):
             coord[:] = [coord[0], coord[1], float(z)]
