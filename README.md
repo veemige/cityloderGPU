@@ -6,13 +6,11 @@
 
 The tool provides **OBJ meshes** and **CityJSON** file city models. It can also integrate street network data from GeoJSON files when available.
 
-CityLODer is designed for reproducible and cross-platform use through Docker, with wrapper scripts for Windows PowerShell and Linux/macOS Bash. Advanced users can also run the Python and C++ components locally for customization and development.
+CityLODer runs locally through a Python environment and a compiled C++ mesh generator. Linux and WSL are supported by the included local runner.
 
 ## Requirements
 
-CityLODer can be run using Docker, which is the recommended method. Docker 20.1 or later is required. Usage is simplified through wrapper scripts for both Linux/macOS and Windows.
-
-Advanced users can also run CityLODer in a local Python/C++ development environment (see (see [Local Development](#local-development))).
+CityLODer requires Python, a C++17 compiler, CMake, and the Python development headers. It is executed directly on the host system.
 
 
 ## Installation
@@ -24,10 +22,27 @@ git clone --recurse-submodules https://github.com/EliaMTH/CityLODer.git
 cd CityLODer
 ```
 
-### 2. Build the Docker Image
+### 2. Create the Python environment
 
 ```bash
-docker build -t cityloder .
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r core/requirements.txt
+python -m pip install pybind11
+```
+
+For NVIDIA GPU acceleration, install the optional dependencies:
+
+```bash
+python -m pip install -r requirements-gpu.txt
+```
+
+### 3. Build the C++ mesh generator
+
+```bash
+cmake -S mesh_gen -B .build/cityloder -DCMAKE_BUILD_TYPE=Release
+cmake --build .build/cityloder --parallel
 ```
 
 
@@ -114,96 +129,46 @@ data/
 └── (street_network.geojson)
 ````
 
-### Windows PowerShell
+### Linux/WSL local runner
 
-#### Minimal Example
-
-```powershell
-.\wrapper_windows\cityloder_app.ps1 `
-  -LAS_PATH "data\point_cloud.las" `
-  -INPUT2D_PATH "data\footprints.shp"
-```
-
-#### Full Example
-
-```powershell
-.\wrapper_windows\cityloder_app.ps1 `
-  -LAS_PATH "data\point_cloud.las" `
-  -INPUT2D_PATH "data\footprints.shp" `
-  -OUTPUT_FILE_PATH "output" `
-  -OUTPUT_FILE_NAME "mycity" `
-  -GRAPH_PATH "data\street_network.geojson" `
-  -CLASS_BUILDING 6 `
-  -CLASS_GROUND 2
-```
-
-### Linux/macOS Bash Wrapper
-
-Make the wrapper executable if needed:
+Make the local runner executable:
 
 ```bash
-chmod +x wrapper_linux/cityloder
+chmod +x wrapper_linux/cityloder_local
 ```
 
-#### Minimal Example
+The runner accepts multiple LAS/LAZ files separated by commas:
 
 ```bash
-./wrapper_linux/cityloder \
-  -LAS_PATH "data/point_cloud.las" \
-  -INPUT2D_PATH "data/footprints.shp"
+./wrapper_linux/cityloder_local \
+  "data/point_cloud.las" \
+  "data/footprints.shp"
 ```
 
-#### Full Example
+With output name and an optional street network:
 
 ```bash
-./wrapper_linux/cityloder \
-  -LAS_PATH "data/point_cloud.las" \
-  -INPUT2D_PATH "data/footprints.shp" \
-  -OUTPUT_FILE_PATH "output" \
-  -OUTPUT_FILE_NAME "mycity" \
-  -GRAPH_PATH "data/street_network.geojson" \
-  -CLASS_BUILDING 6 \
-  -CLASS_GROUND 2
+./wrapper_linux/cityloder_local \
+  "data/point_cloud.las" \
+  "data/footprints.shp" \
+  "output" \
+  "mycity" \
+  "data/street_network.geojson" \
+  "EPSG:31982"
 ```
 
 
 ### Custom, Debug, or Batch Processing
 
-For custom configurations, debugging, or batch processing, CityLODer can be run directly through Docker.
-
-The repository includes a `launcher.sh` script (in the `misc` folder) that shows an example direct Docker invocation. You can edit this script to match your dataset paths, output folders, classification codes, and optional street network input.
-
-A direct Docker command has the following structure:
+For custom configurations, debugging, or batch processing, use the local
+runner with the appropriate input and output paths:
 
 ```bash
-docker run --rm \
-  -u $(id -u):$(id -g) \
-  -v "$(pwd)/data:/data" \
-  cityloder \
-  /data/point_cloud.las \
-  /data/footprints.shp \
-  /data/output \
-  mycity \
-  /data/street_network.geojson \
-  6 \
-  2 \
-  /data/output/tmp
-```
-
-On Windows PowerShell, the equivalent command is:
-
-```powershell
-docker run --rm `
-  -v "$($PWD.Path)\data:/data" `
-  cityloder `
-  /data/point_cloud.las `
-  /data/footprints.shp `
-  /data/output `
-  mycity `
-  /data/street_network.geojson `
-  6 `
-  2 `
-  /data/output/tmp
+./wrapper_linux/cityloder_local \
+  "data/point_cloud.las" \
+  "data/footprints.shp" \
+  "output" \
+  "mycity"
 ```
 
 
@@ -213,8 +178,8 @@ docker run --rm `
 
 | Parameter      | Description                              | Example                |
 | -------------- | ---------------------------------------- | ---------------------- |
-| `LAS_PATH`     | Path to the LAS/LAZ point cloud          | `point_cloud.las` |
-| `INPUT2D_PATH` | Path to the building footprint shapefile | `footprints.shp`  |
+| `LAS_PATH`     | Path to one or more LAS/LAZ files, comma-separated | `point_cloud.las` |
+| `INPUT2D_PATH` | Path to the building footprint shapefile         | `footprints.shp`  |
 
 ### Optional Parameters
 
@@ -222,10 +187,8 @@ docker run --rm `
 | ------------------ | -------: | ------------------------------------------------ |
 | `OUTPUT_FILE_PATH` | `output` | Output directory                                 |
 | `OUTPUT_FILE_NAME` | `mycity` | Base name for output model folder/files          |
-| `GRAPH_PATH`       |      `.` | Optional street network GeoJSON. Use `.` to skip |
-| `CLASS_BUILDING`   |      `6` | LAS classification code for building points      |
-| `CLASS_GROUND`     |      `2` | LAS classification code for ground points        |
-| `TEMP_FOLD`        |      `.` | Temporary working directory                      |
+| `GRAPH_PATH`       | empty | Optional street network GeoJSON. Leave empty to skip |
+| `GRAPH_TARGET_CRS` | empty | CRS used to reproject the street network            |
 
 ## Output Files
 
@@ -260,72 +223,61 @@ Depending on whether a street network is provided, `street_graph_updated.geojson
 ### Simple Processing
 
 ```bash
-sudo ./cityloder_app \
-  -LAS_PATH matera.las \
-  -INPUT2D_PATH matera.shp
+./wrapper_linux/cityloder_local \
+  "data/matera.las" \
+  "data/matera.shp"
 ```
 
 This writes outputs using the default output folder and model name.
 
 ### Processing with Custom Output Name
 
-```powershell
-.\wrapper_windows\cityloder_app.ps1 `
-  -LAS_PATH "data\city.las" `
-  -INPUT2D_PATH "data\buildings.shp" `
-  -OUTPUT_FILE_PATH "results" `
-  -OUTPUT_FILE_NAME "matera_model"
+```bash
+./wrapper_linux/cityloder_local \
+  "data/city.las" \
+  "data/buildings.shp" \
+  "results" \
+  "matera_model"
 ```
 
 ### Processing with Street Network
 
-```powershell
-.\wrapper_windows\cityloder_app.ps1 `
-  -LAS_PATH "data\city.las" `
-  -INPUT2D_PATH "data\buildings.shp" `
-  -OUTPUT_FILE_PATH "results\processed_city" `
-  -OUTPUT_FILE_NAME "final_model" `
-  -GRAPH_PATH "data\streets.geojson"
+```bash
+./wrapper_linux/cityloder_local \
+  "data/city.las" \
+  "data/buildings.shp" \
+  "results/processed_city" \
+  "final_model" \
+  "data/streets.geojson"
 ```
 
 ### Custom Classification Codes
 
 Use this when the input LAS file uses non-standard class codes.
 
-```powershell
-.\wrapper_windows\cityloder_app.ps1 `
-  -LAS_PATH "data\custom_classification.las" `
-  -INPUT2D_PATH "data\footprints.shp" `
-  -OUTPUT_FILE_PATH "output" `
-  -CLASS_BUILDING 7 `
-  -CLASS_GROUND 3
+```bash
+python core/cityloder_main.py \
+  "data/footprints.shp" \
+  "" \
+  "data/custom_classification.las" \
+  "output/custom_model" \
+  7 \
+  3 \
+  "output/custom_model_tmp" \
+  "output/custom_model_tmp/ground_polygon"
 ```
 
 ## Troubleshooting
-
-### Docker Image Not Found
-
-Make sure the Docker image has been built and that its name matches the one expected by the wrappers. By default, the wrappers expect the image to be named `cityloder`:
-
-```bash
-docker build -t cityloder .
-````
 
 ### Permission Denied on Linux/macOS
 
 Make the wrapper executable:
 
 ```bash
-chmod +x wrapper_linux/cityloder
+chmod +x wrapper_linux/cityloder_local
 ```
 
-If Docker permission errors occur, either run with `sudo` or add your user to the Docker group:
-
-```bash
-sudo usermod -aG docker $USER
-```
-
-Then log out and log back in.
+Run the command from the project root.
 
 ### PowerShell Script Execution Is Disabled
 
@@ -368,7 +320,7 @@ The default ground class is `2`.
 
 ## Local Development and Dependencies
 
-CityLODer can be run without Docker using a local Python/C++ environment.
+CityLODer runs in a local Python/C++ environment.
 
 ### Run locally from WSL/Linux
 
