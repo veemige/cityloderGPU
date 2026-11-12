@@ -32,7 +32,7 @@ Arguments:
   PYTHON_BIN        Python executable or virtual environment path
   BUILD_DIR         CMake build directory. Default: .build\cityloder
 
-The script runs natively on Windows; it does not use Docker.
+The script runs natively on Windows.
 "@
 }
 
