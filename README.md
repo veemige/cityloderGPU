@@ -1,5 +1,7 @@
 # CityLODer GPU
 
+Relatório técnico: [otimizações, uso de CUDA e limites das medições](docs/RELATORIO_OTIMIZACOES.md).
+
 Reconstrução de cidades a partir de nuvens LAS/LAZ classificadas e contornos de
 edifícios em Shapefile. O projeto exporta CityJSON, malhas OBJ separadas de
 edifícios e terreno e uma malha completa que reúne as duas partes.
