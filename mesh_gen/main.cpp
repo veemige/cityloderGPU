@@ -10,7 +10,7 @@ using namespace cinolib;
 
 int main(int argc, char *argv[])
 {
-    if (argc != 5) {
+    if (argc < 5) {
         std::cout << "Welcome to CityIconicMesh! Please specify the followings:\n"
                      "- the path to the boundary .off file\n"
                      "- the path to the folder containing the triangulated buildings .off files\n"
@@ -22,6 +22,10 @@ int main(int argc, char *argv[])
     std::string buildings_path = argv[2];
     std::string streets_path   = argv[3];
     std::string output_path    = argv[4];
+    bool        save_parts     = false;
+    for (int i=5; i<argc; ++i) {
+        if (std::string(argv[i]) == "--save-parts") save_parts = true;
+    }
 
     Profiler prof;
     City city;
@@ -43,8 +47,8 @@ int main(int argc, char *argv[])
     city.compute_buildings_mesh();
     double t_buildings = prof.pop();
 
-    prof.push("Create city mesh");
-    city.compute_city_mesh();
+    prof.push("Merge ground and buildings");
+    city.merge_meshes();
     double t_city = prof.pop();
 
     double t_total = t_load + t_ground + t_buildings + t_city;
@@ -54,7 +58,7 @@ int main(int argc, char *argv[])
     if (!output_path.empty()) {
         prof.push("Save meshes");
         open_directory(output_path);
-        city.save(output_path);
+        city.save(output_path, save_parts);
         prof.pop();
     }
 
@@ -74,7 +78,7 @@ int main(int argc, char *argv[])
               << std::right << std::setw(8) << t_ground << " s\n";
     std::cout << std::left << std::setw(30) << "Buildings mesh:"
               << std::right << std::setw(8) << t_buildings << " s\n";
-    std::cout << std::left << std::setw(30) << "City mesh:"
+    std::cout << std::left << std::setw(30) << "Merge meshes:"
               << std::right << std::setw(8) << t_city << " s\n";
     std::cout << std::left << std::setw(30) << "Total execution time:"
               << std::right << std::setw(8) << t_total << " s\n";

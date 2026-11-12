@@ -1,3 +1,4 @@
+from cityloder_gpu import nearest_xy
 #!/usr/bin/env python3
 
 import json
@@ -106,7 +107,7 @@ def preprocess_graph(geojson_path, xyz_ground, out_folder, target_crs=None):
             for coord, projected in zip(nodes, xy):
                 coord[0], coord[1] = float(projected[0]), float(projected[1])
 
-        _, idx = cKDTree(xyz_ground[:, :2]).query(xy, k=1)
+        _, idx = nearest_xy(xyz_ground, xy)
         for coord, z in zip(nodes, xyz_ground[idx, 2]):
             coord[:] = [coord[0], coord[1], float(z)]
 

@@ -6,7 +6,9 @@ from matplotlib.path import Path as MatplotlibPath  # for CPU point-in-polygon
 from scipy.spatial import cKDTree
 from tqdm import tqdm
 
-from cityloder_gpu import fit_roof_planes, gpu_summary, points_in_polygon
+from cityloder_gpu import (fit_roof_planes, gpu_summary, points_in_polygon,
+    make_point_index, polygon_mask_device, to_host, array_module, roof_statistics,
+    nearest_xy, gpu_failure, GPUPointIndex, CudaExecutionError)
 
 
 ## -------------------------------------------------------------------------------
@@ -80,6 +82,8 @@ def read_shapefile_to_dict(shapefile_path):
     return M
 
 def _points_in_bbox(points, tree, x_min, x_max, y_min, y_max):
+    if isinstance(tree, GPUPointIndex):
+        return tree.bbox(x_min, x_max, y_min, y_max)
     if tree is None:
         candidates = points
     else:
@@ -173,16 +177,19 @@ def PointSelectionAndDataStructure(xyz=None, M_i=None, other=None, xyz_tree=None
     if pip.shape[0] > 1:  # Need at least 2 points for inpolygon
         # Dense polygons use a CUDA ray-cast kernel when CuPy is installed.
         polygon = pip[:-1, :]
-        in_mask, _ = points_in_polygon(
-            building[:, :2],
-            polygon,
-            lambda pts, poly: MatplotlibPath(poly).contains_points(pts),
-        )
-        if np.any(in_mask):
-            building = building[in_mask, :]
+        if array_module(building) is not np:
+            in_mask = polygon_mask_device(building, polygon)
+        else:
+            in_mask, _ = points_in_polygon(
+                building[:, :2], polygon,
+                lambda pts, poly: MatplotlibPath(poly).contains_points(pts),
+            )
+        # An empty polygon selection is empty, not the entire bounding box.
+        building = building[in_mask, :]
 
 
-    return other_aus,X,Y,building
+
+    return to_host(other_aus),X,Y,building
 
 ##
 
@@ -356,31 +363,81 @@ def exportRoof(points_build_r, lab, dirNames):
 ## ---------------------------------- MAIN -------------------------------
 ## -------------------------------------------------------------------------------
 
-def main(temp_fold, xyz, other, M, final_id, final_check_adj):
+def main(
+    temp_fold,
+    xyz,
+    other,
+    M,
+    final_id,
+    final_check_adj,
+    indices=None,
+    ground_by_index=None,
+    id_to_final=None,
+    progress_prefix="",
+):
+    """Generate building OFF files.
+
+    ``indices`` allows the caller to process only the buildings that belong
+    to one tile/block.  Building directory names always use the global index
+    (``building{i+1}``), so the files can be accumulated into one mesh.
+    """
 
     ## Initialize further variables
-    zMin_default = np.mean(other[:, 2])
-    points_ground = np.empty((0, 4))
+    zMin_default = float(np.mean(other[:, 2])) if other.shape[0] else 0.0
+    building_indices = list(range(len(M))) if indices is None else list(indices)
+    if ground_by_index is None:
+        ground_by_index = {}
+    if id_to_final is None:
+        id_to_final = {}
+        for j, ids in enumerate(final_id):
+            for original_id in np.ravel(ids):
+                id_to_final[int(original_id)] = j
 
     buildings_outside_pc = 0
-    xyz_tree = cKDTree(xyz[:, :2]) if xyz.shape[0] else None
-    other_tree = cKDTree(other[:, :2]) if other.shape[0] else None
+    xyz_tree = make_point_index(xyz)
+    other_tree = make_point_index(other)
+    if xyz_tree is None and xyz.shape[0]:
+        xyz_tree = cKDTree(xyz[:, :2])
+    if other_tree is None and other.shape[0]:
+        other_tree = cKDTree(other[:, :2])
+    try:
+        for index, divisor in ((xyz_tree, 500), (other_tree, 4)):
+            if isinstance(index, GPUPointIndex):
+                index.prepare(M, building_indices, divisor)
+    except Exception as exc:
+        gpu_failure("batched spatial ranges", exc)
+        xyz_tree = cKDTree(xyz[:, :2]) if len(xyz) else None
+        other_tree = cKDTree(other[:, :2]) if len(other) else None
     roof_normals = []
     roof_rhs = []
     roof_centers = []
     pending_buildings = []
 
-    for i in tqdm(range(0, len(M)), desc="Processing Buildings"):
+    for i in tqdm(building_indices, desc=f"{progress_prefix}Processing Buildings"):
 
         # Computing other_aus, control, X, Y, xy, zMin, building
-        other_aus,X,Y,building = PointSelectionAndDataStructure(
-            xyz, M[i], other, xyz_tree, other_tree
-        )
+        try:
+            other_aus,X,Y,building = PointSelectionAndDataStructure(
+                xyz, M[i], other, xyz_tree, other_tree
+            )
+        except CudaExecutionError:
+            raise
+        except Exception as exc:
+            if not isinstance(xyz_tree, GPUPointIndex) and not isinstance(other_tree, GPUPointIndex):
+                raise
+            gpu_failure("building spatial selection", exc)
+            xyz_tree = cKDTree(xyz[:, :2]) if len(xyz) else None
+            other_tree = cKDTree(other[:, :2]) if len(other) else None
+            other_aus,X,Y,building = PointSelectionAndDataStructure(
+                xyz, M[i], other, xyz_tree, other_tree
+            )
 
         if building.shape[0] > 0:
-            z_max = float(np.max(building[:, 2]))
-            if building.shape[0] > 50000:
-                building = building[::10, :]
+            try:
+                z_max, z_ceiling, roof_center, normal, rhs = roof_statistics(building)
+            except Exception as exc:
+                gpu_failure("roof statistics", exc)
+                z_max, z_ceiling, roof_center, normal, rhs = roof_statistics(to_host(building))
 
             xy = []
             for x, y in zip(X, Y):
@@ -399,71 +456,47 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
 
 
 
-            # ----------------- Edit
+            # Interpolate ground heights at the footprint vertices.  If
+            # this building touches neighbours, also use the ground points
+            # already computed for those neighbours instead of scanning the
+            # entire (city-wide) point list for every building.
             val = final_check_adj[i]
-            if np.isscalar(val) and np.isnan(val):
-                if other_aus.shape[0] > 0:
-                    tree = cKDTree(other_aus[:, :2])
-                    _, I = tree.query(xy)
-                    z = other_aus[I, 2]
-                else:
-                    z = zMin_default * np.ones((xy.shape[0]))
+            point_parts = [other_aus] if other_aus.size else []
+            if not (np.isscalar(val) and np.isnan(val)):
+                for original_id in np.ravel(val):
+                    try:
+                        neighbour = id_to_final.get(int(original_id))
+                    except (TypeError, ValueError):
+                        continue
+                    if neighbour is None:
+                        continue
+                    neighbour_points = ground_by_index.get(neighbour)
+                    if neighbour_points is not None and neighbour_points.size:
+                        point_parts.append(neighbour_points)
+
+            points = np.vstack(point_parts) if point_parts else other_aus
+            if points.size != 0:
+                _, I = nearest_xy(points, xy)
+                z = points[I, 2]
             else:
-                id_close_building = final_check_adj[i]
-                points = other_aus
-                for j in range(0,len(M)-1):
-                    for ja in range(0,len(id_close_building)):
-                        if np.isin(id_close_building[ja], final_id[j]).sum() > 0:
-                            points = np.vstack([
-                                    points,
-                                    points_ground[points_ground[:, 3] == j, :3]
-                                ])
-                if points.size != 0:
-                    tree = cKDTree(points[:, :2])
-                    _, I = tree.query(xy)
-                    z = points[I, 2]
-                else:
-                    z = zMin_default * np.ones((xy.shape[0]))
-            # ----------------- 
+                z = zMin_default * np.ones((xy.shape[0]))
 
-
-
-
-            points_aus_ground = np.zeros((xy.shape[0],6))
-
-            
             xyz_aus = np.hstack([xy, z[:, np.newaxis]])
-            points_aus_ground[:, 0:3] = xyz_aus
-            points_aus_ground[:, 4] = i
-            # ----------------- Edit 
-            points_ground = np.vstack([
-                points_ground,
-                np.hstack([xyz_aus, i * np.ones((xyz_aus.shape[0], 1))])
-            ])
-            # -----------------
+            ground_by_index[i] = xyz_aus
+            points_aus_ground = xyz_aus
             
             # Fit one planar roof to upper building-class points. The centered
             # normal equations are solved together on CUDA after point selection.
-            roof_mask = building[:, 2] >= np.quantile(building[:, 2], 0.65)
-            roof_points = building[roof_mask]
             roof_plane_id = None
-            roof_center = None
-            if roof_points.shape[0] >= 6:
-                roof_center = np.mean(roof_points[:, :2], axis=0)
-                design = np.column_stack(
-                    (roof_points[:, :2] - roof_center, np.ones(roof_points.shape[0]))
-                )
-                normal = design.T @ design
-                rhs = design.T @ roof_points[:, 2]
-                if np.linalg.matrix_rank(normal) == 3:
-                    roof_plane_id = len(roof_normals)
-                    roof_normals.append(normal)
-                    roof_rhs.append(rhs)
-                    roof_centers.append(roof_center)
+            if normal is not None:
+                roof_plane_id = len(roof_normals)
+                roof_normals.append(normal)
+                roof_rhs.append(rhs)
+                roof_centers.append(roof_center)
 
             pending_buildings.append(
                 (i, xy, lab, points_aus_ground[:, :3], z_max,
-                 roof_plane_id, roof_center, float(np.quantile(building[:, 2], 0.995)))
+                 roof_plane_id, roof_center, z_ceiling)
             )
 
         else: 
@@ -499,7 +532,7 @@ def main(temp_fold, xyz, other, M, final_id, final_check_adj):
         print("Roof plane fits: solved as one CUDA batch")
     print(gpu_summary())
     
-    print("Saved building polygons:", len(M))
+    print("Saved building polygons:", len(building_indices))
 
     return buildings_outside_pc
 

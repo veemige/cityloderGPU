@@ -1,3 +1,4 @@
+from cityloder_gpu import nearest_xy, filter_classes, prefetch_chunks
 import laspy
 from pathlib import Path
 from scipy.spatial import cKDTree
@@ -37,22 +38,24 @@ def read_las_file(file_path, class_building = 6, class_ground = 2):
         if not path.is_file():
             raise FileNotFoundError(f"Arquivo LAS não encontrado: {path}")
 
-        las = laspy.read(path)
-        classification = np.asarray(las.classification)
-        x = np.asarray(las.x)
-        y = np.asarray(las.y)
-        z = np.asarray(las.z)
-        point_count += len(classification)
-        bounds_min = np.minimum(bounds_min, [x.min(), y.min()])
-        bounds_max = np.maximum(bounds_max, [x.max(), y.max()])
-
-        for class_code, chunks in (
-            (class_building, building_chunks),
-            (class_ground, ground_chunks),
-        ):
-            mask = classification == class_code
-            if np.any(mask):
-                chunks.append(np.column_stack((x[mask], y[mask], z[mask])).astype(float))
+        with laspy.open(path) as reader:
+            bounds_min = np.minimum(bounds_min, reader.header.mins[:2])
+            bounds_max = np.maximum(bounds_max, reader.header.maxs[:2])
+            for las in prefetch_chunks(reader):
+                classification = np.asarray(las.classification)
+                x, y, z = (np.asarray(values, dtype=np.float64) for values in (las.x, las.y, las.z))
+                point_count += len(classification)
+                result = filter_classes(x, y, z, classification, [-np.inf, -np.inf],
+                                        [np.inf, np.inf], class_building, class_ground)
+                if result is not None:
+                    for points, chunks in zip(result, (building_chunks, ground_chunks)):
+                        if points.size:
+                            chunks.append(points)
+                else:
+                    for class_code, chunks in ((class_building, building_chunks), (class_ground, ground_chunks)):
+                        mask = classification == class_code
+                        if np.any(mask):
+                            chunks.append(np.column_stack((x[mask], y[mask], z[mask])))
 
     if not ground_chunks:
         raise ValueError(f"Nenhum ponto da classe de terreno {class_ground} foi encontrado.")
@@ -64,11 +67,22 @@ def read_las_file(file_path, class_building = 6, class_ground = 2):
 
     return xyz_building, xyz_ground, point_count, (bounds_min, bounds_max)
 
-def generate_ground_polygon(xyz, other, outname="ground_polygon", offset=50.0):
+def generate_ground_polygon(
+    xyz,
+    other,
+    outname="ground_polygon",
+    offset=50.0,
+    samples=None,
+):
     """
     Build a fast 2D convex hull from the XY coordinates of `xyz` and `other`,
     enlarge it by `offset`, assign Z from nearest XY point in `other`,
     then export a single-face OFF polygon as `<outname>.off`.
+
+    If `samples` (an Nx3 array) is given, its points are written as
+    unreferenced OFF vertices.  The C++ mesh generator passes those vertices
+    to Triangle, so they constrain the terrain across the whole area instead
+    of only along the outer boundary.
     """
     xyz = np.asarray(xyz, dtype=np.float64)
     other = np.asarray(other, dtype=np.float64)
@@ -155,16 +169,39 @@ def generate_ground_polygon(xyz, other, outname="ground_polygon", offset=50.0):
     # ----------------------------------------
     # Assign Z from nearest XY point in `other`
     # ----------------------------------------
-    tree = cKDTree(other[:, :2])
-    _, idx = tree.query(hull2d)
+    _, idx = nearest_xy(other, hull2d)
     hull3d = np.column_stack((hull2d, other[idx, 2]))
 
     # Write OFF
     off_path = outname if outname.lower().endswith(".off") else f"{outname}.off"
+    extra = np.empty((0, 3), dtype=float)
+    if samples is not None:
+        extra = np.asarray(samples, dtype=float)
+        if extra.size == 0:
+            extra = np.empty((0, 3), dtype=float)
+        else:
+            extra = extra.reshape(-1, 3)
+            # Hull vertices are already part of the polygon; avoid writing
+            # exact duplicates as unreferenced vertices.
+            hull_keys = {
+                (round(float(x), 9), round(float(y), 9))
+                for x, y in hull3d[:, :2]
+            }
+            keep = np.array(
+                [
+                    (round(float(x), 9), round(float(y), 9)) not in hull_keys
+                    for x, y in extra[:, :2]
+                ],
+                dtype=bool,
+            )
+            extra = extra[keep]
+
     with open(off_path, "w") as f:
         f.write("OFF\n")
-        f.write(f"{len(hull3d)} 1 0\n")
+        f.write(f"{len(hull3d) + len(extra)} 1 0\n")
         for x, y, z in hull3d:
+            f.write(f"{x:.12g} {y:.12g} {z:.12g}\n")
+        for x, y, z in extra:
             f.write(f"{x:.12g} {y:.12g} {z:.12g}\n")
         face_idx = " ".join(map(str, range(len(hull3d))))
         f.write(f"{len(hull3d)} {face_idx}\n")

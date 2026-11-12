@@ -32,6 +32,7 @@ BUILD_DIR="${CITYLODER_BUILD_DIR:-$HOME/.cache/cityloder-build}"
 PYTHON_BIN="${CITYLODER_PYTHON:-python3}"
 
 mkdir -p "$OUTPUT_DIR" "$TEMP_FOLD"
+PIPELINE_START_NS="$(date +%s%N)"
 
 if [[ ! -x "$BUILD_DIR/city_iconic_mesh" ]]; then
     cmake -S mesh_gen -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
@@ -69,3 +70,10 @@ fi
     "$TEMP_FOLD" \
     "$GRAPH_FOR_MESH" \
     "$OUTPUT_DIR/$MODEL_NAME"
+
+PIPELINE_END_NS="$(date +%s%N)"
+PIPELINE_SECONDS="$(( (PIPELINE_END_NS - PIPELINE_START_NS) / 1000000000 ))"
+echo "---------------------------------------"
+echo "Pipeline completed successfully"
+echo "Total pipeline time: ${PIPELINE_SECONDS}s"
+echo "---------------------------------------"

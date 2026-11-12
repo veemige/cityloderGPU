@@ -3,14 +3,67 @@
 
 #include <cinolib/meshes/meshes.h>
 
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <streambuf>
+#include <unordered_map>
 
 namespace cinolib
 {
 
 namespace fs = std::filesystem;
+
+/*************** COINCIDENT VERTEX LOOKUPS ****************/
+
+// Exact-coordinate keys used to merge meshes in linear time.  The old
+// implementation rebuilt an octree for every footprint/building, which
+// made a city-wide run quadratic.
+struct Vec2Key
+{
+    double x, y;
+    bool operator==(const Vec2Key &o) const { return x==o.x && y==o.y; }
+};
+
+struct Vec3Key
+{
+    double x, y, z;
+    bool operator==(const Vec3Key &o) const { return x==o.x && y==o.y && z==o.z; }
+};
+
+inline size_t hash_double(double v)
+{
+    v += 0.0; // normalise -0.0 to +0.0
+    uint64_t bits;
+    std::memcpy(&bits, &v, sizeof(bits));
+    bits ^= bits >> 33;
+    bits *= 0xff51afd7ed558ccdULL;
+    bits ^= bits >> 33;
+    bits *= 0xc4ceb9fe1a85ec53ULL;
+    bits ^= bits >> 33;
+    return static_cast<size_t>(bits);
+}
+
+struct Vec2KeyHash
+{
+    size_t operator()(const Vec2Key &k) const
+    {
+        return hash_double(k.x) ^ (hash_double(k.y) * 0x9e3779b97f4a7c15ULL);
+    }
+};
+
+struct Vec3KeyHash
+{
+    size_t operator()(const Vec3Key &k) const
+    {
+        return hash_double(k.x) ^ (hash_double(k.y) * 0x9e3779b97f4a7c15ULL)
+                              ^ (hash_double(k.z) * 0xc2b2ae3d27d4eb4fULL);
+    }
+};
+
+using Vec2KeyMap = std::unordered_map<Vec2Key,uint,Vec2KeyHash>;
+using Vec3KeyMap = std::unordered_map<Vec3Key,uint,Vec3KeyHash>;
 
 /*************** GEOMETRIC OPERATIONS ****************/
 

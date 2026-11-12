@@ -1,8 +1,9 @@
 numpy
 scipy
 laspy
+lazrs
 pyshp
-shapely
+shapely>=2.1
 matplotlib
 pybind11
 tqdm

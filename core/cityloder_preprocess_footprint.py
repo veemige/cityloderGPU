@@ -1,10 +1,27 @@
 import numpy as np
 import shapefile
+from shapely import STRtree
 from shapely.geometry import GeometryCollection, Polygon
 from shapely.ops import unary_union
 from tqdm import tqdm
 
-import fast_inpolygon
+try:
+    import fast_inpolygon
+except ImportError:
+    fast_inpolygon = None
+
+
+def _inpolygon(points_x, points_y, polygon_x, polygon_y):
+    if fast_inpolygon is not None:
+        return fast_inpolygon.inpolygon(points_x, points_y, polygon_x, polygon_y)
+
+    from matplotlib.path import Path
+
+    points = np.column_stack((points_x, points_y))
+    polygon = np.column_stack((polygon_x, polygon_y))
+    inside = Path(polygon).contains_points(points)
+    on = np.zeros(points.shape[0], dtype=bool)
+    return inside, on
 
 def polyarea(x, y):
     x = np.asarray(x)
@@ -164,8 +181,6 @@ def footprint_preprocess(fname, hole_thr=1, bounds=None):
 
     building = []
     id_building = []
-    list_ext_points = []
-    num_building = []
 
     # New output
     original_buildings = []
@@ -224,14 +239,13 @@ def footprint_preprocess(fname, hole_thr=1, bounds=None):
             continue
 
         poly_e = rings[0]
-        sampled_points = _sample_boundary_points(poly_e)
 
         if len(rings) > 1:
             lab_int = []
             lab_ext = []
 
             for ring_idx, poly_i in enumerate(rings[1:], start=2):
-                inside, on = fast_inpolygon.inpolygon(
+                inside, on = _inpolygon(
                     poly_i[:, 0], poly_i[:, 1],
                     poly_e[:, 0], poly_e[:, 1]
                 )
@@ -250,10 +264,6 @@ def footprint_preprocess(fname, hole_thr=1, bounds=None):
             building.append(_join_parts(main_parts, trailing_nan=True))
             id_building.append(id_oggetto)
 
-            current_idx = len(building) - 1
-            list_ext_points.append(sampled_points)
-            num_building.append(np.full(len(sampled_points), current_idx, dtype=int))
-
             # Preserve exact MATLAB behavior
             for ring_idx, _flag in lab_ext:
                 poly_i = rings[ring_idx - 1]
@@ -261,18 +271,9 @@ def footprint_preprocess(fname, hole_thr=1, bounds=None):
                 building.append(_join_parts([poly_i], trailing_nan=True))
                 id_building.append(id_oggetto)
 
-                sampled_i = _sample_boundary_points(poly_i)
-                current_idx = len(building) - 1
-                list_ext_points.append(sampled_i)
-                num_building.append(np.full(len(sampled_i), current_idx, dtype=int))
-
         else:
             building.append(poly_e.copy())
             id_building.append(id_oggetto)
-
-            current_idx = len(building) - 1
-            list_ext_points.append(sampled_points)
-            num_building.append(np.full(len(sampled_points), current_idx, dtype=int))
 
     # ------------------------------------------------------------------
     # Check error "footprint has duplicate vertices"
@@ -302,69 +303,83 @@ def footprint_preprocess(fname, hole_thr=1, bounds=None):
         building[i] = _join_parts(cleaned_parts, trailing_nan=True)
 
     # ------------------------------------------------------------------
-    # Check intersecting polygons
+    # Check intersecting polygons using a spatial index.  The previous
+    # implementation allocated a dense N x N matrix (about 38 GB for the
+    # full city) and compared every footprint against every other one.
     n_buildings = len(building)
-    dist = np.zeros((n_buildings, n_buildings), dtype=int)
-    check_adj = [np.array([], dtype=object) for _ in range(n_buildings)]
+    check_adj = [set() for _ in range(n_buildings)]
 
-    if list_ext_points:
-        list_ext_points = np.vstack(list_ext_points)
-        num_building = np.concatenate(num_building)
-    else:
-        list_ext_points = np.empty((0, 2), dtype=float)
-        num_building = np.empty((0,), dtype=int)
+    if n_buildings == 0:
+        return [], [], [], original_buildings
 
+    geoms = []
+    for xy in building:
+        try:
+            geom = _xy_to_geometry(xy)
+        except Exception:
+            geom = GeometryCollection()
+        if not geom.is_empty and not geom.is_valid:
+            try:
+                fixed = geom.buffer(0)
+                if not fixed.is_empty:
+                    geom = fixed
+            except Exception:
+                pass
+        geoms.append(geom)
+
+    valid_idx = [
+        i for i, geom in enumerate(geoms)
+        if not geom.is_empty and geom.geom_type in ("Polygon", "MultiPolygon")
+    ]
+
+    merge_edges = []
+    if len(valid_idx) > 1:
+        valid_geoms = [geoms[i] for i in valid_idx]
+        tree = STRtree(valid_geoms)
+        pairs = tree.query(valid_geoms, predicate="intersects")
+        for a, b in zip(pairs[0].tolist(), pairs[1].tolist()):
+            if a >= b:
+                continue
+            i = valid_idx[a]
+            j = valid_idx[b]
+            try:
+                overlap_area = geoms[i].intersection(geoms[j]).area
+            except Exception:
+                overlap_area = 0.0
+            if overlap_area > 1e-6:
+                merge_edges.append((i, j))
+            else:
+                # Buildings sharing a boundary but not overlapping.
+                check_adj[i].add(id_building[j])
+                check_adj[j].add(id_building[i])
+
+    # Connected components of intersecting / overlapping buildings.
+    parent = list(range(n_buildings))
+    rank = [0] * n_buildings
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return
+        if rank[ra] < rank[rb]:
+            ra, rb = rb, ra
+        parent[rb] = ra
+        if rank[ra] == rank[rb]:
+            rank[ra] += 1
+
+    for i, j in merge_edges:
+        union(i, j)
+
+    components = {}
     for i in range(n_buildings):
-        parts = _split_parts(building[i])
-        if not parts:
-            continue
-
-        # Only the exterior polygon matters here
-        p = parts[0]
-        inside, on = fast_inpolygon.inpolygon(
-            list_ext_points[:, 0], list_ext_points[:, 1],
-            p[:, 0], p[:, 1]
-        )
-
-        # Only adjacent, no true interior overlap
-        if np.count_nonzero(inside) == np.count_nonzero(on):
-            idx = np.unique(num_building[inside])
-            if idx.size > 1:
-                check_adj[i] = np.asarray([id_building[k] for k in idx], dtype=object)
-
-        # Remove boundary-only points
-        inside_no_on = inside.copy()
-        inside_no_on[on] = False
-
-        # Build adjacency matrix of intersecting buildings
-        idx = np.unique(num_building[inside_no_on])
-        for k in idx:
-            dist[i, k] = 1
-            dist[k, i] = 1
-
-    # Connected components of intersecting buildings
-    components = []
-    visited = np.zeros(n_buildings, dtype=bool)
-
-    for start in range(n_buildings):
-        if visited[start]:
-            continue
-
-        stack = [start]
-        visited[start] = True
-        comp = []
-
-        while stack:
-            u = stack.pop()
-            comp.append(u)
-
-            neighbors = np.flatnonzero(dist[u])
-            for v in neighbors:
-                if not visited[v]:
-                    visited[v] = True
-                    stack.append(v)
-
-        components.append(set(comp))
+        components.setdefault(find(i), []).append(i)
+    components = list(components.values())
 
     # ------------------------------------------------------------------
     # Merge connected components
@@ -380,28 +395,26 @@ def footprint_preprocess(fname, hole_thr=1, bounds=None):
             final_building.append(building[j])
             final_id.append(np.asarray([id_building[j]], dtype=object))
 
-            if check_adj[j].size > 0:
-                final_check_adj.append(check_adj[j])
+            if check_adj[j]:
+                final_check_adj.append(np.asarray(sorted(check_adj[j]), dtype=object))
             else:
                 final_check_adj.append(np.nan)
 
         else:
             geom = _xy_to_geometry(building[idx[0]])
             ids = [id_building[idx[0]]]
-            adj_ids = check_adj[idx[0]].ravel().tolist() if check_adj[idx[0]].size > 0 else []
+            adj_ids = set(check_adj[idx[0]])
 
             for j in idx[1:]:
                 geom = unary_union([geom, _xy_to_geometry(building[j])])
                 ids.append(id_building[j])
-
-                if check_adj[j].size > 0:
-                    adj_ids.extend(check_adj[j].ravel().tolist())
+                adj_ids.update(check_adj[j])
 
             final_building.append(_geometry_to_xy(geom))
             final_id.append(np.asarray(ids, dtype=object))
 
             if adj_ids:
-                final_check_adj.append(np.asarray(adj_ids, dtype=object))
+                final_check_adj.append(np.asarray(sorted(adj_ids), dtype=object))
             else:
                 final_check_adj.append(np.nan)
 

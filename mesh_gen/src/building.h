@@ -70,12 +70,19 @@ public:
     void add_building_to_mesh(AbstractPolygonMesh<M,V,E,P> &m) const;
 
     vec3d get_point_in_footprint() { return pick_point_in_polygon(footprint, 0); }
+    vec3d get_point_in_footprint() const
+    {
+        Polygonmesh<> copy = footprint;
+        return pick_point_in_polygon(copy, 0);
+    }
 
     // getters
     Polygonmesh<> get_footprint()   const { return footprint; }
+    const Polygonmesh<> &get_footprint_ref() const { return footprint; }
     Polygonmesh<> get_roof()        const { return roof; }
     Polygonmesh<> get_facades()     const { return facades; }
     Polygonmesh<> get_building()    const { return building; }
+    const Polygonmesh<> &get_building_ref() const { return building; }
     uint          get_building_ID() const { return building_ID; }
 };
 

@@ -1,3 +1,5 @@
+#include <map>
+#include <tuple>
 #ifndef CITY
 #define CITY
 
@@ -44,10 +46,10 @@ public:
 
     void compute_ground_mesh();
     void compute_buildings_mesh();
-    void compute_city_mesh();
+    void merge_meshes();
 
     void verify_mesh(const Trimesh<> &m);
-    void save(const string &dir_path);
+    void save(const string &dir_path, bool save_parts = false);
     void write_streets_data(const string &filepath);
     // void visualize_streets(DrawableSegmentSoup &soup) const;
 
@@ -109,50 +111,87 @@ void City::compute_buildings_mesh()
             B.create_building_mesh();
             restore_stdout(buf);
         }
-        // add the building to the global mesh m
-        uint n = buildings_mesh.num_polys();
-        merge_meshes_at_coincident_vertices(buildings_mesh, B.get_building(), buildings_mesh);
-        // label the new polys with the building ID
+        // Append the building directly.  Buildings do not share vertices in
+        // normal footprints, so rebuilding an octree for every append (as the
+        // previous merge did) only made this step quadratic.  Shared base
+        // vertices are snapped against the ground in merge_meshes.
+        const Polygonmesh<> &bm = B.get_building_ref();
+        uint v_offset = buildings_mesh.num_verts();
+        for (uint vid=0; vid<bm.num_verts(); ++vid) {
+            buildings_mesh.vert_add(bm.vert(vid));
+        }
         int building_ID = B.get_building_ID();
-        for (uint pid=n; pid<buildings_mesh.num_polys(); ++pid) {
-            buildings_mesh.poly_data(pid).label = building_ID;
+        for (uint pid=0; pid<bm.num_polys(); ++pid) {
+            std::vector<uint> p = bm.poly_verts_id(pid);
+            for (uint &vid : p) vid += v_offset;
+            uint fresh_id = buildings_mesh.poly_add(p);
+            buildings_mesh.poly_data(fresh_id).label = building_ID;
         }
         ++count;
     }
+    buildings_mesh.update_bbox();
     std::cout << std::endl;
     // verify_mesh(buildings_mesh);
 }
 
 // --------------------------------------------------------------------------------------------
 
-void City::compute_city_mesh()
+void City::merge_meshes()
 {
-    // merge meshes
     const Trimesh<> *ground_mesh = ground.get_ground_ptr();
-    if (buildings_mesh.num_polys()==0) {
-        compute_buildings_mesh();
+
+    city_mesh.clear();
+
+    // Append the ground first and remember every vertex by its XY position.
+    Vec2KeyMap vertex_map;
+    vertex_map.reserve(ground_mesh->num_verts() * 2 + buildings_mesh.num_verts());
+    for (uint vid=0; vid<ground_mesh->num_verts(); ++vid) {
+        vec3d p = ground_mesh->vert(vid);
+        uint fresh_id = city_mesh.vert_add(p);
+        vertex_map.emplace(Vec2Key{p.x(), p.y()}, fresh_id);
     }
-    merge_meshes_at_coincident_vertices(*ground_mesh, buildings_mesh, city_mesh);
-    // copy mesh labels
-    uint n_ground    = ground_mesh->num_polys();
-    uint n_buildings = buildings_mesh.num_polys();
-    uint n_city      = city_mesh.num_polys();
-    uint n           = n_ground + n_buildings;
-    for (uint pid=0; pid<n_city; ++pid) {
-        if (pid%100 == 0) {
-            std::cout << "\r\033[K"; // deletes the line
-            std::cout << "City::compute_city_mesh - poly " << pid << " / "
-                      << n_city << std::flush;
-        }
-        if (pid < n_ground) {
-            city_mesh.poly_data(pid).label = ground_mesh->poly_data(pid).label;
-        } else if (pid < n) {
-            city_mesh.poly_data(pid).label = buildings_mesh.poly_data(pid - n_ground).label;
+    for (uint pid=0; pid<ground_mesh->num_polys(); ++pid) {
+        std::vector<uint> p = ground_mesh->poly_verts_id(pid);
+        uint fresh_id = city_mesh.poly_add(p);
+        city_mesh.poly_data(fresh_id).label = ground_mesh->poly_data(pid).label;
+    }
+
+    // Snap building vertices to the ground rim by XY, so walls and ground
+    // are welded even when the two height interpolations differ slightly.
+    std::map<std::tuple<double, double, double>, uint> building_vertices;
+    std::vector<uint> remap(buildings_mesh.num_verts());
+    for (uint vid=0; vid<buildings_mesh.num_verts(); ++vid) {
+        vec3d p = buildings_mesh.vert(vid);
+        Vec2Key key{p.x(), p.y()};
+        auto it = vertex_map.find(key);
+        if (it != vertex_map.end() &&
+            std::abs(city_mesh.vert(it->second).z() - p.z()) < 0.01) {
+            remap[vid] = it->second;
         } else {
-            city_mesh.poly_data(pid).label = -1;
+            auto xyz = std::make_tuple(p.x(), p.y(), p.z());
+            auto found = building_vertices.find(xyz);
+            if (found != building_vertices.end()) {
+                remap[vid] = found->second;
+            } else {
+                uint fresh_id = city_mesh.vert_add(p);
+                building_vertices.emplace(xyz, fresh_id);
+                remap[vid] = fresh_id;
+            }
         }
+    }
+    for (uint pid=0; pid<buildings_mesh.num_polys(); ++pid) {
+        if (pid%1000 == 0) {
+            std::cout << "\r\033[K"; // deletes the line
+            std::cout << "City::merge_meshes - poly " << pid << " / "
+                      << buildings_mesh.num_polys() << std::flush;
+        }
+        std::vector<uint> p = buildings_mesh.poly_verts_id(pid);
+        for (uint &vid : p) vid = remap[vid];
+        uint fresh_id = city_mesh.poly_add(p);
+        city_mesh.poly_data(fresh_id).label = buildings_mesh.poly_data(pid).label;
     }
     std::cout << std::endl;
+    city_mesh.update_bbox();
     if (WITH_STREETS) {
         mark_streets(*ground_mesh);
     }
@@ -267,24 +306,24 @@ void City::mark_streets(const Trimesh<> &m)
 
 // --------------------------------------------------------------------------------------------
 
-void City::save(const string &dir_path)
+void City::save(const string &dir_path, bool save_parts)
 {
-    string city_filename        = dir_path + "/city_mesh.obj";
-    string buildings_filename   = dir_path + "/buildings_mesh.obj";
-    string ground_filename      = dir_path + "/ground_mesh.obj";
-    string poly_labels_filename = dir_path + "/polys_buildings_IDs.csv";
-    string edge_labels_filename = dir_path + "/edges_streets_IDs.csv";
+    string mesh_filename = dir_path + "/mesh.obj";
+    string buildings_filename = dir_path + "/buildings_mesh.obj";
+    string ground_filename    = dir_path + "/ground_mesh.obj";
 
     translate_back();
 
-    buildings_mesh.poly_color_wrt_label();
     city_mesh.poly_color_wrt_label();
+    city_mesh.save(mesh_filename.c_str());
 
-    city_mesh.save(city_filename.c_str());
-    buildings_mesh.save(buildings_filename.c_str());
-    ground.save(ground_filename.c_str());
-    // print_poly_labels(poly_labels_filename);
-    // print_edge_labels(edge_labels_filename);
+    // The merged city mesh is the default product.  The individual parts
+    // are only written when explicitly requested.
+    if (save_parts) {
+        buildings_mesh.poly_color_wrt_label();
+        buildings_mesh.save(buildings_filename.c_str());
+        ground.save(ground_filename.c_str());
+    }
 }
 
 // --------------------------------------------------------------------------------------------
@@ -330,7 +369,12 @@ void City::load_boundary_polygon(const string &filepath)
     if (boundary.num_polys() != 1 && !boundary.mesh_is_manifold()) {
         throw std::runtime_error("Error: the boundary mesh should contain a single (manifold) polygon");
     }
-    scene_center = boundary.centroid();
+    // Use the boundary face only.  The OFF may also carry isolated ground
+    // sample points (vertices without faces), which must not bias the center.
+    scene_center = vec3d(0,0,0);
+    const std::vector<uint> &outer = boundary.adj_p2v(0);
+    for (uint vid : outer) scene_center += boundary.vert(vid);
+    scene_center /= double(outer.size());
     boundary.translate(-scene_center);
 }
 
@@ -346,6 +390,7 @@ void City::load_buildings_data(const string &dir_path)
         if (!entry.is_directory()) continue;
         string dir            = entry.path().string();
         int    ID             = extract_directory_ID(dir);
+        if (ID < 1) continue; // cache/metadata folders are not buildings
         string footprint_file = dir + "/pavement_polygon.off";
         string roof_file      = dir + "/roof_polygon.off";
         string facades_file   = dir + "/facades.off";

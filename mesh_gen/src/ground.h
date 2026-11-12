@@ -20,9 +20,9 @@ private:
     Trimesh<>        ground_mesh;
     vector<vec3d>    holes;
     Polygonmesh<>    boundary;
-    vector<Building> buildings;
-    vector<Street>   streets;
-    bool             WITH_STREETS;
+    const vector<Building> *buildings = nullptr;
+    const vector<Street>   *streets   = nullptr;
+    bool             WITH_STREETS = false;
     vec3d            scene_center;
 
     void translate_back();
@@ -56,9 +56,9 @@ void Ground::setup(const Polygonmesh<>    &boundary_mesh,
                    const vec3d            &center)
 {
     boundary     = boundary_mesh;
-    buildings    = buildings_data;
-    streets      = street_data;
-    WITH_STREETS = !streets.empty();
+    buildings    = &buildings_data;
+    streets      = &street_data;
+    WITH_STREETS = !street_data.empty();
     scene_center = center;
 }
 
@@ -66,55 +66,85 @@ void Ground::setup(const Polygonmesh<>    &boundary_mesh,
 
 void Ground::compute()
 {
-    // start from the boundary and translate it the origin
+    // Start from the boundary and project it to the plane z=0.  Ground
+    // elevations are kept in a hash map keyed by the exact XY position.
     Polygonmesh<> m = boundary;
-    std::unordered_map<uint, double> z_map;
-    project_mesh(m, z_map);
+    std::unordered_map<Vec2Key, double, Vec2KeyHash> z_map;
+    z_map.reserve(m.num_verts() * 2 + 1024);
+    Vec2KeyMap vertex_map;
+    vertex_map.reserve(m.num_verts() * 2 + 1024);
 
-    // add footprints to the mesh
+    for (uint vid=0; vid<m.num_verts(); ++vid) {
+        vec3d p = m.vert(vid);
+        Vec2Key key{p.x(), p.y()};
+        z_map.emplace(key, p.z());
+        vertex_map.emplace(key, vid);
+        m.vert(vid).z() = 0.;
+    }
+    m.update_bbox();
+
+    auto add_vertex = [&](const vec3d &p) -> uint
+    {
+        Vec2Key key{p.x(), p.y()};
+        auto it = vertex_map.find(key);
+        if (it != vertex_map.end()) return it->second;
+        uint vid = m.vert_add(vec3d(p.x(), p.y(), 0.));
+        vertex_map.emplace(key, vid);
+        z_map.emplace(key, p.z());
+        return vid;
+    };
+
+    // Add the footprints to the mesh, reusing vertices shared by adjacent
+    // buildings.  This replaces the previous octree merge, which rebuilt
+    // the whole spatial index for each footprint.
     vector<vec3d> holes;
     int count = 0;
-    for (Building B : buildings) {
+    uint duplicate_footprint_polys = 0;
+    for (const Building &B : *buildings) {
         std::cout << "\r\033[K"; // deletes the line
         std::cout << "Ground::compute_ground_mesh - building " << count << " / "
-                  << buildings.size() << std::flush;
-        // project the footprint to the plane z=0
-        std::unordered_map<uint, double> footprint_z_map;
-        B.project_footprint(footprint_z_map);
-        // append footprint_z_map to z_map
-        append_map(B.get_footprint().vector_verts(), footprint_z_map, m.vector_verts(), z_map);
-        // add the footprint to the mesh
-        B.add_footprint_to_mesh(m);
-        // add a point inside the footprint to the holes list
-        // holes.push_back(pick_point_in_polygon(B.get_footprint(), 0));
+                  << buildings->size() << std::flush;
+
+        const Polygonmesh<> &fp = B.get_footprint_ref();
+        std::vector<uint> remap(fp.num_verts());
+        for (uint vid=0; vid<fp.num_verts(); ++vid) {
+            remap[vid] = add_vertex(fp.vert(vid));
+        }
+        for (uint pid=0; pid<fp.num_polys(); ++pid) {
+            std::vector<uint> p = fp.poly_verts_id(pid);
+            for (uint &vid : p) vid = remap[vid];
+            uint before = m.num_polys();
+            uint added  = m.poly_add(p);
+            if (added < before) duplicate_footprint_polys++;
+        }
         holes.push_back(B.get_point_in_footprint());
         count++;
     }
     std::cout << std::endl;
+    if (duplicate_footprint_polys > 0) {
+        std::cout << "  Ground::compute - duplicate footprint polys skipped: "
+                  << duplicate_footprint_polys << std::endl;
+    }
 
-    // add streets to the mesh
+    // Add streets to the mesh and assign a label to the corresponding edges.
     if (WITH_STREETS) {
         count = 0;
-        for (Street s : streets) {
+        for (const Street &s : *streets) {
             std::cout << "\r\033[K"; // deletes the line
             std::cout << "Ground::compute - street " << count << " / "
-                      << streets.size() << std::flush;
-            // project the street to the plane z=0
-            std::unordered_map<uint, double> street_z_map;
-            s.project(street_z_map);
-            // append street_z_map to z_map
-            append_map({s.get_v0(), s.get_v1()}, street_z_map, m.vector_verts(), z_map);
-            // add the street to the mesh and assign a label to the corresponding edges
-            s.add_to_mesh(m);
+                      << streets->size() << std::flush;
+            vec3d p0 = s.get_v0();
+            vec3d p1 = s.get_v1();
+            uint vid0 = add_vertex(p0);
+            uint vid1 = add_vertex(p1);
+            if (vid0 != vid1) {
+                int eid = m.edge_id(vid0, vid1);
+                if (eid == -1) eid = m.edge_add(vid0, vid1);
+                m.edge_data(eid).label = s.get_ID();
+            }
             count++;
         }
         std::cout << std::endl;
-    }
-    if (z_map.size() != m.num_verts()) {
-        std::cout << "  Ground::compute - ERROR: projection added "
-                  << z_map.size() - m.num_verts()
-                  << " new vertices in the mesh!" << std::endl;
-        exit(0);
     }
 
     // triangulate the mesh with holes
@@ -129,8 +159,22 @@ void Ground::compute()
                   << ground_mesh.num_verts() - m.num_verts()
                   << " new vertices in the ground mesh!" << std::endl;
     }
-    // translate back to the original position
-    project_back_mesh(ground_mesh, z_map);
+    // Restore elevations by exact XY position.  Looking up by position also
+    // makes this safe if Triangle reorders the input vertices.
+    uint missing = 0;
+    for (uint vid=0; vid<ground_mesh.num_verts(); ++vid) {
+        vec3d p = ground_mesh.vert(vid);
+        auto it = z_map.find(Vec2Key{p.x(), p.y()});
+        if (it != z_map.end()) {
+            ground_mesh.vert(vid).z() = it->second;
+        } else {
+            ++missing;
+        }
+    }
+    if (missing > 0) {
+        std::cout << "  Ground::compute - WARNING: " << missing
+                  << " triangulated vertices have no elevation." << std::endl;
+    }
     ground_mesh.update_bbox();
     ground_mesh.mesh_data().filename = m.mesh_data().filename;
 }
